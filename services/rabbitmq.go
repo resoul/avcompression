@@ -2,6 +2,7 @@ package services
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -18,27 +19,27 @@ type RabbitMQService struct {
 func NewRabbitMQService(cfg config.RabbitMQConfig) (*RabbitMQService, error) {
 	conn, err := amqp.Dial(cfg.URL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial rabbitmq failed: %w", err)
 	}
 
 	ch, err := conn.Channel()
 	if err != nil {
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("open channel failed: %w", err)
 	}
 
 	q, err := ch.QueueDeclare(
 		cfg.QueueName,
-		true,  // durable
-		false, // auto-delete
-		false, // exclusive
-		false, // no-wait
+		true,
+		false,
+		false,
+		false,
 		nil,
 	)
 	if err != nil {
 		ch.Close()
 		conn.Close()
-		return nil, err
+		return nil, fmt.Errorf("declare queue failed (queue=%s): %w", cfg.QueueName, err)
 	}
 
 	return &RabbitMQService{
@@ -51,15 +52,15 @@ func NewRabbitMQService(cfg config.RabbitMQConfig) (*RabbitMQService, error) {
 func (s *RabbitMQService) Consume(handler func(models.JobMessage)) error {
 	msgs, err := s.channel.Consume(
 		s.queue.Name,
-		"",    // consumer tag
-		true,  // auto-ack
-		false, // exclusive
-		false, // no-local
-		false, // no-wait
+		"",
+		true,
+		false,
+		false,
+		false,
 		nil,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("start consuming failed: %w", err)
 	}
 
 	forever := make(chan bool)
@@ -68,7 +69,7 @@ func (s *RabbitMQService) Consume(handler func(models.JobMessage)) error {
 		for msg := range msgs {
 			var job models.JobMessage
 			if err := json.Unmarshal(msg.Body, &job); err != nil {
-				log.Printf("❌ failed to parse job: %v", err)
+				log.Printf("❌ failed to unmarshal job: %v", err)
 				continue
 			}
 			go handler(job)
