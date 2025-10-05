@@ -1,51 +1,50 @@
 package main
 
 import (
-	"fmt"
-	"log"
-	"net/http"
+	"os"
 
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/resoul/avcompression/config"
 	"github.com/resoul/avcompression/services"
+	"github.com/sirupsen/logrus"
 )
 
 func main() {
 	cfg := config.MustLoad()
+	setupLogger(cfg.App.LogLevel)
 	cfg.Print()
-
-	var metrics *services.Metrics
-	if cfg.Metrics.Enabled {
-		metrics = services.NewMetrics()
-		log.Println("📊 Metrics initialized")
-	}
 
 	minioService, err := services.NewMinioService(cfg.Minio)
 	if err != nil {
-		log.Fatalf("❌ failed to init MinIO: %v", err)
+		logrus.WithError(err).Fatal("Failed to initialize MinIO service")
 	}
 
 	rabbitService, err := services.NewRabbitMQService(cfg.RabbitMQ)
 	if err != nil {
-		log.Fatalf("❌ failed to init RabbitMQ: %v", err)
+		logrus.WithError(err).Fatal("Failed to initialize RabbitMQ service")
 	}
 	defer rabbitService.Close()
 
-	processor := services.NewProcessor(minioService, metrics)
+	processor := services.NewProcessor(minioService)
 
-	if cfg.Metrics.Enabled {
-		go func() {
-			http.Handle(cfg.Metrics.Path, promhttp.Handler())
-			addr := fmt.Sprintf(":%d", cfg.Metrics.Port)
-			log.Printf("📈 Metrics server started on %s%s", addr, cfg.Metrics.Path)
-			if err := http.ListenAndServe(addr, nil); err != nil {
-				log.Printf("⚠️  metrics server error: %v", err)
-			}
-		}()
-	}
-
-	log.Println("🎧 Waiting for jobs...")
+	logrus.Info("Waiting for jobs...")
 	if err := rabbitService.Consume(processor.HandleJob); err != nil {
-		log.Fatalf("❌ failed to consume messages: %v", err)
+		logrus.WithError(err).Fatal("Failed to consume messages")
 	}
+}
+
+func setupLogger(level string) {
+	logrus.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+		ForceColors:     true,
+	})
+
+	logrus.SetOutput(os.Stdout)
+
+	logLevel, err := logrus.ParseLevel(level)
+	if err != nil {
+		logrus.Warnf("Invalid log level '%s', defaulting to 'info'", level)
+		logLevel = logrus.InfoLevel
+	}
+	logrus.SetLevel(logLevel)
 }

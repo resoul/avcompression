@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"image"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,50 +13,35 @@ import (
 	_ "image/png"
 
 	"github.com/resoul/avcompression/models"
+	"github.com/sirupsen/logrus"
 )
 
 type Processor struct {
-	minio   *MinioService
-	metrics *Metrics
+	minio *MinioService
 }
 
-func NewProcessor(minio *MinioService, metrics *Metrics) *Processor {
+func NewProcessor(minio *MinioService) *Processor {
 	return &Processor{
-		minio:   minio,
-		metrics: metrics,
+		minio: minio,
 	}
 }
 
 func (p *Processor) HandleJob(job models.JobMessage) {
 	startTime := time.Now()
 
-	p.metrics.ActiveJobs.Inc()
-	defer p.metrics.ActiveJobs.Dec()
+	log := logrus.WithFields(logrus.Fields{
+		"job_uuid": job.UUID,
+		"bucket":   job.Bucket,
+	})
 
-	log.Printf("📥 Processing job %s", job.UUID)
+	log.Info("Processing job started")
 
-	err := p.processJob(job)
-
-	duration := time.Since(startTime)
-	p.metrics.JobDuration.Observe(duration.Seconds())
-
-	if err != nil {
-		log.Printf("❌ %v", err)
-		p.metrics.JobsTotal.WithLabelValues("failed").Inc()
-
-		if jobErr, ok := err.(*JobError); ok {
-			p.metrics.JobsFailed.WithLabelValues(
-				string(jobErr.Type),
-				jobErr.Op,
-			).Inc()
-		}
+	if err := p.processJob(job); err != nil {
+		log.WithError(err).WithField("duration", time.Since(startTime)).Error("Job processing failed")
 		return
 	}
 
-	p.metrics.JobsTotal.WithLabelValues("success").Inc()
-	p.metrics.JobsSuccessful.Inc()
-
-	log.Printf("✅ Job %s completed in %v", job.UUID, duration.Round(time.Millisecond))
+	log.WithField("duration", time.Since(startTime)).Info("Job processing completed")
 }
 
 func (p *Processor) processJob(job models.JobMessage) error {
@@ -65,71 +49,55 @@ func (p *Processor) processJob(job models.JobMessage) error {
 
 	tmpDir := filepath.Join("/tmp", job.UUID)
 	if err := os.MkdirAll(tmpDir, os.ModePerm); err != nil {
-		return newJobError(ErrTypeSystem, job.UUID, "create_temp_dir", err)
+		return fmt.Errorf("create temp dir: %w", err)
 	}
 	defer func() {
 		if err := os.RemoveAll(tmpDir); err != nil {
-			log.Printf("⚠️  failed to cleanup temp dir: %v", err)
+			logrus.WithError(err).Warn("Failed to cleanup temp directory")
 		}
 	}()
 
 	imageLocal := filepath.Join(tmpDir, filepath.Base(job.ImagePath))
-	downloadStart := time.Now()
 	if err := p.minio.DownloadFile(ctx, job.Bucket, job.ImagePath, imageLocal); err != nil {
-		return newJobError(ErrTypeMinIO, job.UUID, "download_image", err)
+		return fmt.Errorf("download image: %w", err)
 	}
-	p.metrics.DownloadDuration.Observe(time.Since(downloadStart).Seconds())
-
-	if stat, err := os.Stat(imageLocal); err == nil {
-		p.metrics.ImageSizeBytes.Observe(float64(stat.Size()))
-	}
-	log.Printf("  ⬇️  Downloaded image: %s", filepath.Base(job.ImagePath))
+	logrus.WithField("file", filepath.Base(job.ImagePath)).Debug("Downloaded image")
 
 	audioLocal := filepath.Join(tmpDir, filepath.Base(job.AudioPath))
-	downloadStart = time.Now()
 	if err := p.minio.DownloadFile(ctx, job.Bucket, job.AudioPath, audioLocal); err != nil {
-		return newJobError(ErrTypeMinIO, job.UUID, "download_audio", err)
+		return fmt.Errorf("download audio: %w", err)
 	}
-	p.metrics.DownloadDuration.Observe(time.Since(downloadStart).Seconds())
-
-	if stat, err := os.Stat(audioLocal); err == nil {
-		p.metrics.AudioSizeBytes.Observe(float64(stat.Size()))
-	}
-	log.Printf("  ⬇️  Downloaded audio: %s", filepath.Base(job.AudioPath))
+	logrus.WithField("file", filepath.Base(job.AudioPath)).Debug("Downloaded audio")
 
 	outputLocal := filepath.Join(tmpDir, "output.mp4")
-	ffmpegStart := time.Now()
-	resolution, err := p.createVideoFromImageAndAudio(imageLocal, audioLocal, outputLocal, job.UUID)
+	resolution, err := p.createVideoFromImageAndAudio(imageLocal, audioLocal, outputLocal)
 	if err != nil {
-		return newJobError(ErrTypeFFmpeg, job.UUID, "create_video", err)
+		return fmt.Errorf("create video: %w", err)
 	}
-	p.metrics.FFmpegDuration.Observe(time.Since(ffmpegStart).Seconds())
-	p.metrics.VideoResolutions.WithLabelValues(resolution).Inc()
-	log.Printf("  🎬 Video created")
-
-	if stat, err := os.Stat(outputLocal); err == nil {
-		p.metrics.VideoSizeBytes.Observe(float64(stat.Size()))
-	}
+	logrus.WithField("resolution", resolution).Debug("Video created")
 
 	outputObj := filepath.Join(job.UUID, "output.mp4")
-	uploadStart := time.Now()
 	if err := p.minio.UploadFile(ctx, job.Bucket, outputObj, outputLocal); err != nil {
-		return newJobError(ErrTypeMinIO, job.UUID, "upload_video", err)
+		return fmt.Errorf("upload video: %w", err)
 	}
-	p.metrics.UploadDuration.Observe(time.Since(uploadStart).Seconds())
-	log.Printf("  ⬆️  Uploaded: %s", outputObj)
+	logrus.WithField("path", outputObj).Debug("Video uploaded")
 
 	return nil
 }
 
-func (p *Processor) createVideoFromImageAndAudio(imagePath, audioPath, outputPath, jobUUID string) (string, error) {
+func (p *Processor) createVideoFromImageAndAudio(imagePath, audioPath, outputPath string) (string, error) {
 	targetWidth, targetHeight, err := p.calculateTargetResolution(imagePath)
 	if err != nil {
 		return "", fmt.Errorf("calculate resolution: %w", err)
 	}
 
 	resolution := p.formatResolution(targetWidth, targetHeight)
-	log.Printf("  📐 Target resolution: %s (%dx%d)", resolution, targetWidth, targetHeight)
+
+	logrus.WithFields(logrus.Fields{
+		"resolution": resolution,
+		"width":      targetWidth,
+		"height":     targetHeight,
+	}).Debug("Target resolution calculated")
 
 	scaleFilter := fmt.Sprintf("scale=%d:%d", targetWidth, targetHeight)
 
