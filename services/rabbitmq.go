@@ -3,11 +3,11 @@ package services
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/resoul/avcompression/config"
 	"github.com/resoul/avcompression/models"
+	"github.com/sirupsen/logrus"
 )
 
 type RabbitMQService struct {
@@ -69,7 +69,7 @@ func (s *RabbitMQService) Consume(handler func(models.JobMessage)) error {
 		for msg := range msgs {
 			var job models.JobMessage
 			if err := json.Unmarshal(msg.Body, &job); err != nil {
-				log.Printf("❌ failed to unmarshal job: %v", err)
+				logrus.WithError(err).Error("Failed to unmarshal job message")
 				continue
 			}
 			go handler(job)
